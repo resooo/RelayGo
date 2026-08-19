@@ -54,9 +54,9 @@ android/local.properties
 *.key
 /keystore.properties
 android/keystore.properties
-# 例外：Release 签名密钥库需随仓库保留，保证环境重置后签名指纹一致
-!android/keystore/*.jks
-!android/keystore/*.keystore
+# Release 签名密钥库不入库：私钥公开会带来伪造签名风险
+# 请通过本地 keystore.properties 或 CI 加密变量提供签名凭据
+android/keystore/
 
 # IDE / OS
 .idea/
