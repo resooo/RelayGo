@@ -1,0 +1,33 @@
+allprojects {
+    repositories {
+        // 国内镜像优先，加速依赖下载（远程沙箱环境）
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+// 统一固定 NDK 版本为本地已完整安装的 28.2.13676358，
+// 避免 AGP 默认使用未完整下载的版本导致构建失败。
+// 使用 plugins.withId 在插件应用时即生效，不受项目求值顺序影响。
+allprojects {
+    plugins.withId("com.android.library") {
+        android.ndkVersion = "28.2.13676358"
+    }
+    plugins.withId("com.android.application") {
+        android.ndkVersion = "28.2.13676358"
+    }
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.layout.buildDirectory
+}
