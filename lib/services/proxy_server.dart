@@ -24,6 +24,7 @@ import 'package:relaygo/services/rate_limiter.dart';
 import 'package:relaygo/services/report_service.dart';
 import 'package:relaygo/services/rule_engine.dart';
 import 'package:relaygo/services/update_service.dart';
+import 'package:relaygo/services/upstream_error.dart';
 import 'package:relaygo/utils/usage_parser.dart';
 import 'package:relaygo/l10n/app_strings.dart';
 
@@ -198,8 +199,7 @@ class ProxyServer {
       await _acquire();
     } on _ProxyOverload {
       await _respondError(request, 429, '请求过于繁忙，请稍后再试');
-      _recordLog(request, null, 'proxy', 429, 0,
-          error: 'concurrency limit');
+      _recordLog(request, null, 'proxy', 429, 0, error: 'concurrency limit');
       return;
     }
 
@@ -250,8 +250,8 @@ class ProxyServer {
     if (!inbound.allowed) {
       request.response.headers
           .set(Constants.retryAfterHeader, '${inbound.retryAfterSeconds}');
-      await _respondError(request, 429,
-          inbound.message.isEmpty ? '请求过于频繁' : inbound.message);
+      await _respondError(
+          request, 429, inbound.message.isEmpty ? '请求过于频繁' : inbound.message);
       _recordLog(request, null, Environment.detectProvider(path), 429,
           stopwatch.elapsedMilliseconds,
           error: 'rate limited: ${inbound.dimension}',
@@ -292,8 +292,9 @@ class ProxyServer {
 
     // 2) 规则引擎：构建上下文并求值
     final ctx = RuleEngine.buildContext(proxyRequest);
-    final detected =
-        Environment.detectProvider(path, model: payload.model, headerProvider: headers[Constants.providerHeader]);
+    final detected = Environment.detectProvider(path,
+        model: payload.model,
+        headerProvider: headers[Constants.providerHeader]);
     ctx['request']['provider'] = detected;
     RoutingDecision? decision;
     if (settings.rulesEnabled) {
@@ -344,15 +345,16 @@ class ProxyServer {
     final forwardResult =
         await _forwardWithFallback(proxyRequest, detected, decision);
     if (forwardResult is _ForwardFailure) {
-      final msg = forwardResult.lastError != null
-          ? '上游转发失败：${forwardResult.lastError}'
-          : forwardResult.reason;
+      // 用户可见信息始终使用友好、可读的 reason；原始上游错误体只进日志，
+      // 避免把 "inference tpm exhausted" / "FREE_QUOTA_EXHAUSTED" 等原始报文
+      // 直接抛给用户，造成不必要的打扰。
+      final msg = forwardResult.reason;
       // 可恢复 TPM 限流且已等待预算耗尽：返回 429 + Retry-After，
       // 让 AI 客户端排队后自动重发，而不是硬断成 503（避免“发送继续后仍可用”的中断）。
       if (forwardResult.retryAfterSeconds > 0) {
         // 提示客户端等待后重试（OpenAI/Anthropic 认可的标准做法）
-        request.response.headers
-            .set(Constants.retryAfterHeader, '${forwardResult.retryAfterSeconds}');
+        request.response.headers.set(
+            Constants.retryAfterHeader, '${forwardResult.retryAfterSeconds}');
         await _respondError(request, 429, msg);
         _recordLog(request, null, detected, 429, stopwatch.elapsedMilliseconds,
             model: payload.model,
@@ -396,7 +398,8 @@ class ProxyServer {
       final usage = UsageParser.parseBytes(written.captured);
       final prevStatus = key.status;
       if (!isError) {
-        loadBalancer.recordSuccess(key, latencyMs: stopwatch.elapsedMilliseconds);
+        loadBalancer.recordSuccess(key,
+            latencyMs: stopwatch.elapsedMilliseconds);
       } else {
         loadBalancer.recordFailure(key);
       }
@@ -426,7 +429,8 @@ class ProxyServer {
         tokens: isError ? 0 : usage.total,
         error: isError,
       );
-      if (!isError) rateLimiter.recordTokens(key, usage.total, model: payload.model);
+      if (!isError)
+        rateLimiter.recordTokens(key, usage.total, model: payload.model);
       await keyManager.updateKey(key);
       _maybeEmitKeyStatusChanged(key, prevStatus);
       for (final a in alerts) {
@@ -484,7 +488,8 @@ class ProxyServer {
     RoutingDecision? decision,
   ) async {
     final primaryName = decision?.provider ?? detected;
-    var candidates = Environment.candidateProviders(primaryName, proxyRequest.path);
+    var candidates =
+        Environment.candidateProviders(primaryName, proxyRequest.path);
     final strategy = decision?.strategy ?? loadBalanceStrategy;
 
     // P0：若请求的是能力虚拟模型（virtualId / 品牌别名），先解析为「提供商 → 真实模型名」，
@@ -508,7 +513,8 @@ class ProxyServer {
       }
       // 目录中没有该虚拟模型数据时，回退到内置典型候选（品牌别名也覆盖快捷用法）
       if (virtualActualByProvider.isEmpty) {
-        final typical = StandardModelRegistry.virtualTypical[virtualId] ?? const [];
+        final typical =
+            StandardModelRegistry.virtualTypical[virtualId] ?? const [];
         for (final t in typical) {
           final tp = t['provider']!;
           final tm = t['model']!;
@@ -606,6 +612,7 @@ class ProxyServer {
     int? tpmRetryAfter; // 最终建议客户端等待的秒数（遭遇可恢复 TPM 限流时）
     bool sawRecoverable429 = false;
     ApiKey? lastTpmKey; // 最近一次触发可恢复 TPM 429 的 key
+    int quotaExhaustedCount = 0; // 本轮请求命中「额度耗尽」的 key 数
     while (attempts < settings.maxRetryKeys) {
       if (pool.isEmpty) break;
       final pair = pool[idx % pool.length];
@@ -627,8 +634,7 @@ class ProxyServer {
       ProviderResult? result;
       try {
         // 虚拟模型请求：把请求体里的模型名改写为该提供商下的真实模型
-        final out =
-            _rewriteModel(proxyRequest, pair.actualModel);
+        final out = _rewriteModel(proxyRequest, pair.actualModel);
         final r = await pair.provider.forward(
           out,
           key,
@@ -638,22 +644,24 @@ class ProxyServer {
         if (r.statusCode >= 200 && r.statusCode < 300) {
           return _ForwardOutcome(key, r, attempts, pair.actualModel);
         }
-        // 以下状态码视为可重试，切换下一个 key
-        // 404 = model not found on this key/provider, next candidate might have it
-        // 429 = rate limited
-        // 5xx = server error
-        if (r.statusCode == 404 || r.statusCode == 429 || r.statusCode >= 500) {
-          // 捕获上游错误响应体（前 500 字节），让日志/503 展示真实原因，
-          // 例如 OpenAI 的 "The model 'gpt-4o' does not exist or you do not have access to it"。
+        // 用错误识别器判断本响应是否需要「无感切换 key」重试。
+        // 捕获上游错误响应体（前 500 字节），供分类器与诊断使用，例如 OpenAI
+        // "The model 'gpt-4o' does not exist..."、free quota exhausted 等。
+        if (r.statusCode >= 400 ||
+            (r.statusCode >= 300 && r.statusCode != 304)) {
           final errBody = await _captureUpstreamError(r.body);
-          lastUpstreamError = errBody != null && errBody.isNotEmpty
+          final kind =
+              UpstreamErrorClassifier.classify(r.statusCode, errBody ?? '');
+          lastUpstreamError = (errBody != null && errBody.isNotEmpty)
               ? '上游 HTTP ${r.statusCode}: $errBody'
               : '上游 HTTP ${r.statusCode}';
 
           // —— 可恢复 TPM 限流：等待窗口刷新后重试同一个 key ——
-          if (r.statusCode == 429 &&
-              (errBody == null ||
-                  RateLimiter.isRecoverableTpmLimit(r.statusCode, errBody)) &&
+          // 仅对「429 + TPM 关键词」生效；额度耗尽等其他 429 不在此列，
+          // 应交由下方「无感切换 key」处理。
+          if (kind == UpstreamErrorKind.rateLimited &&
+              UpstreamErrorClassifier.isRecoverableTpm(
+                  r.statusCode, errBody ?? '') &&
               Constants.tpmWaitBudgetMs > 0) {
             // 喂给自适应挡板：把本次 429 当“撞线点”下调学到的 TPM 上限
             rateLimiter.recordUpstreamTpmLimit(
@@ -682,8 +690,36 @@ class ProxyServer {
             break;
           }
 
-          // 404 模型不存在：key 本身正常，只是不含该模型，不标记失败（避免误冷却）
-          if (r.statusCode != 404) {
+          // —— 无感切换 key：仅当错误源于「key / 上游 / 额度」（换一个 key 就可能
+          // 成功）时才静默重试；请求本身的内容问题（badRequest/unknown）直接透传。
+          if (!UpstreamErrorClassifier.isSilentlyRetryable(kind)) {
+            // 请求内容/无法归类的 4xx：切 key 无济于事，透传给客户端
+            return _ForwardOutcome(key, r, attempts, pair.actualModel);
+          }
+
+          // —— 额度耗尽：把当前 key 标记为 exhausted + 冷却 ——
+          // 这样本次请求后续轮询与之后的独立请求都会快速跳过它（不会再次命中
+          // 一个已耗尽的 key），冷却到期后由 KeyManager 自动恢复为 active。
+          if (kind == UpstreamErrorKind.quotaExhausted) {
+            quotaExhaustedCount++;
+            final prev = key.status;
+            if (key.status != KeyStatus.exhausted) {
+              key.status = KeyStatus.exhausted;
+              key.cooldownUntil = DateTime.now().millisecondsSinceEpoch +
+                  Constants.quotaExhaustedCooldownMs;
+              // 额度耗尽是一种「key 问题」，计入失败以便 UI 展示错误倾向；
+              // 但直接进入冷却，不必等满 maxFailureThreshold。
+              key.failureCount++;
+              loadBalancer.recordFailure(key); // 喂健康分窗口（失败）
+              await keyManager.updateKey(key);
+              _maybeEmitKeyStatusChanged(key, prev);
+            }
+            continue;
+          }
+
+          // 模型不存在（modelNotFound）：key 本身正常，只是不含该模型，
+          // 不标记失败（避免误冷却），继续切下一个 key。
+          if (kind != UpstreamErrorKind.modelNotFound) {
             final prev = key.status;
             loadBalancer.recordFailure(key);
             await keyManager.updateKey(key);
@@ -691,7 +727,7 @@ class ProxyServer {
           }
           continue;
         }
-        // 其余 4xx（除 404）：直接透传上游错误，不重试
+        // 3xx（非 304）等其余情况：交给下面的统一处理（正常透传）
         return _ForwardOutcome(key, r, attempts, pair.actualModel);
       } catch (e) {
         lastUpstreamError = e.toString();
@@ -715,7 +751,7 @@ class ProxyServer {
       final secs = tpmRetryAfter ??
           (lastTpmKey == null
               ? 5
-              : (rateLimiter.tpmWaitMillis(lastTpmKey!) ~/ 1000).clamp(1, 120));
+              : (rateLimiter.tpmWaitMillis(lastTpmKey) ~/ 1000).clamp(1, 120));
       return _ForwardFailure(
         '上游 TPM 限流，等待 $secs 秒后重试',
         lastUpstreamError,
@@ -723,8 +759,18 @@ class ProxyServer {
         secs,
       );
     }
+    // 试遍所有候选仍失败：把「额度耗尽」这类可归因的原因汇总为简洁友好的提示，
+    // 而不是把原始上游错误体直接抛给用户。原始细节保留在 [lastUpstreamError]（仅日志）。
+    if (quotaExhaustedCount > 0) {
+      // 该模型/提供商下所有候选 key 的免费/可用额度均已耗尽
+      return _ForwardFailure(
+        '所有候选 key 的免费/可用额度均已用完，请补充或更换 key 后再试',
+        lastUpstreamError,
+        lastActualModel,
+      );
+    }
     return _ForwardFailure(
-      '上游重试耗尽（${settings.maxRetryKeys} 次尝试均失败）',
+      '上游暂时不可用（${settings.maxRetryKeys} 次自动切换均未成功），请稍后再试',
       lastUpstreamError,
       lastActualModel,
     );
@@ -847,9 +893,8 @@ class ProxyServer {
       sink.add(chunk);
       total += chunk.length;
       if (capturedN < cap) {
-        final take = chunk.length < (cap - capturedN)
-            ? chunk.length
-            : (cap - capturedN);
+        final take =
+            chunk.length < (cap - capturedN) ? chunk.length : (cap - capturedN);
         captured.addAll(chunk.sublist(0, take));
         capturedN += take;
       }
@@ -943,8 +988,8 @@ class ProxyServer {
       case Constants.cacheStatsPath:
         if (request.method == 'DELETE') {
           cache.clear();
-          await _jsonResponse(request, 200,
-              {'cleared': true, 'stats': cache.stats.toJson()});
+          await _jsonResponse(
+              request, 200, {'cleared': true, 'stats': cache.stats.toJson()});
           return;
         }
         await _jsonResponse(request, 200, cache.stats.toJson());
@@ -1010,7 +1055,9 @@ class ProxyServer {
         if (vid == null) continue;
         byVirtual.putIfAbsent(vid, () => []).add(m);
       }
-      data = byVirtual.entries.map((e) => _renderVirtualModel(e.key, e.value)).toList();
+      data = byVirtual.entries
+          .map((e) => _renderVirtualModel(e.key, e.value))
+          .toList();
     }
 
     request.response
@@ -1052,7 +1099,9 @@ class ProxyServer {
   /// 仅在请求体是 JSON 且含 `model` 文本字段时改写；其余（无 body、非 JSON、
   /// 无 model 字段、或无需改写）原样返回原请求对象，避免破坏非 chat 类请求体。
   ProxyRequest _rewriteModel(ProxyRequest req, String? actualModel) {
-    if (actualModel == null || actualModel.isEmpty || actualModel == req.model) {
+    if (actualModel == null ||
+        actualModel.isEmpty ||
+        actualModel == req.model) {
       return req;
     }
     if (req.body.isEmpty || req.model.isEmpty) return req;
@@ -1112,8 +1161,8 @@ class ProxyServer {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       event: AlertEvent.updateAvailable,
       level: result.mustUpdate ? AlertLevel.critical : AlertLevel.info,
-      title: L10n.fmt('发现新版本 {version}',
-          {'version': release?.displayVersion ?? ''}),
+      title: L10n.fmt(
+          '发现新版本 {version}', {'version': release?.displayVersion ?? ''}),
       message: release?.releaseNotes.isNotEmpty == true
           ? release!.releaseNotes
           : L10n.tr('有可用更新'),
@@ -1134,9 +1183,8 @@ class ProxyServer {
       id: 'keystatus-${key.id}-${DateTime.now().microsecondsSinceEpoch}',
       timestamp: DateTime.now().millisecondsSinceEpoch,
       event: AlertEvent.keyStatusChanged,
-      level: key.status == KeyStatus.active
-          ? AlertLevel.info
-          : AlertLevel.warning,
+      level:
+          key.status == KeyStatus.active ? AlertLevel.info : AlertLevel.warning,
       title: 'Key ${key.name} 状态变更',
       message: '${_statusLabel(prev)} → ${_statusLabel(key.status)}',
       keyId: key.id,

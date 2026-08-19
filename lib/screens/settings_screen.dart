@@ -29,7 +29,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _appLock;
   // 更新：GitHub 发布仓库（方案一 owner/repo）
   late String _githubRepo;
-  late final TextEditingController _githubCtrl;
+  // 注意：必须在这里立即实例化，否则 initState 访问 _githubCtrl.text 会触发
+  // LateInitializationError（页面灰屏）。
+  final TextEditingController _githubCtrl = TextEditingController();
 
   // 日志
   late int _logRetentionDays;
@@ -663,6 +665,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required List<DropdownMenuItem<T>> items,
     required ValueChanged<T?> onChanged,
   }) {
+    // 防御：升级后保留的持久化设置可能残留不在下拉项中的值，
+    // DropdownButton 会因此断言导致整页灰屏。这里仅在展示时回退到首个
+    // 合法项，不修改真实设置，用户下次保存即修复。
+    final safeValue =
+        items.any((i) => i.value == value) ? value : items.first.value;
     return Container(
       height: 36,
       decoration: BoxDecoration(
@@ -671,7 +678,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<T>(
-          value: value,
+          value: safeValue,
           isDense: true,
           items: items,
           onChanged: onChanged,
@@ -691,10 +698,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     required String label,
     required ValueChanged<double> onChanged,
   }) {
+    // 防御：持久化值可能越界或未对齐到 divisions 档位，Slider 会因此断言
+    // 导致整页灰屏。这里先钳制到 [min,max]，再吸附到最近的档位。
+    final raw = value.clamp(min, max);
+    final snapped = divisions > 0
+        ? (min + ((raw - min) / ((max - min) / divisions)).round() *
+            ((max - min) / divisions))
+        : raw;
     return SizedBox(
       width: 160,
       child: Slider(
-        value: value,
+        value: snapped,
         min: min,
         max: max,
         divisions: divisions,

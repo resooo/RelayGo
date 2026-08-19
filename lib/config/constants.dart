@@ -30,6 +30,7 @@ class Constants {
   static const String updateGithubApiAccept = 'application/vnd.github+json';
   static const String updateGithubApiLatest = '/releases/latest';
   static const String updateGithubApiList = '/releases?per_page=10';
+
   /// 关联发布仓库（owner/repo），默认值供 UserSettings 使用；
   /// 为空串时回退到 `defaultUpdateFeedUrl` 的静态清单。
   static const String defaultUpdateGithubRepo = 'resooo/RelayGo';
@@ -73,8 +74,7 @@ class Constants {
   ];
 
   // 模型列表同步（REQ-003）
-  static const String modelsPath =
-      '/v1/models'; // 代理层对外暴露的聚合模型列表（AI 应用查询用）
+  static const String modelsPath = '/v1/models'; // 代理层对外暴露的聚合模型列表（AI 应用查询用）
   static const String modelsBox = 'models';
   static const String syncHistoryBox = 'sync_history';
 
@@ -130,20 +130,86 @@ class Constants {
   /// 自适应 TPM 挡板默认开启：结合本地用量与上游 429 反馈，把「学到」的
   /// 每 key+模型 token 上限压到实际可用值附近，从源头减少 TPM 限流。
   static const bool defaultAdaptiveTpmEnabled = true;
+
   /// 乘性减：遇到上游 429 时，把当次用量视为上限并下调到其 < 1 的比例，
   /// 为挡板留出余量，避免同一窗口再次撞限。
   static const double tpmAimdDown = 0.85;
+
   /// 加性增：一段时间无 429 后，试探性上调，逐步贴近真实上限。
   static const double tpmAimdUp = 0.02;
+
   /// 429（可恢复 TPM 限流）单次请求最多等待窗口刷新的时长（毫秒）。
   /// 超过预算转为返回 429 + Retry-After，让客户端排队重试而非硬断 503。
   static const int tpmWaitBudgetMs = 8000;
+
   /// 识别「可恢复 TPM 限流」的错误体关键词（命中才等待重试同 key）。
   static const List<String> tpmRecoverableKeywords = [
-    'tokens_per_minute', 'tpm', 'inference_tpm', 'tokens per minute',
-    'rate_limit_reached', 'rate limit reached', 'requests_limit_reached',
-    'context_length_exceeded too_many_requests', 'too_many_requests',
+    'tokens_per_minute',
+    'tpm',
+    'inference_tpm',
+    'tokens per minute',
+    'rate_limit_reached',
+    'rate limit reached',
+    'requests_limit_reached',
+    'context_length_exceeded too_many_requests',
+    'too_many_requests',
   ];
+
+  // —— 上游错误智能识别（无感切换 key，避免中断用户）——
+  /// 表示「该 key 的免费/可用额度已耗尽」的错误体关键词。
+  ///
+  /// 命中后切断当前 key 并自动切换下一个可用 key；若候选全部命中，
+  /// 则汇总为「所有 key 均无可用量」的友好提示而非透传原始错误。
+  /// 覆盖 OpenAI（insufficient_quota / FREE_QUOTA_EXHAUSTED）、Anthropic
+  /// （billing_not_active / credit_balance_too_low / insufficient_credit）、
+  /// Google（daily quota）以及各类第三方网关。
+  static const List<String> quotaExhaustedKeywords = [
+    'free_quota_exhausted',
+    'free quota',
+    'insufficient_quota',
+    'insufficient ledger balance',
+    'exceeded your current quota',
+    'exceeded_current_quota_error',
+    'current quota',
+    'quota_exceeded',
+    'quota exhausted',
+    'billing_not_active',
+    'billing not active',
+    'billing hard limit has been reached',
+    'billing_hard_limit',
+    'credit_balance_too_low',
+    'insufficient_credit',
+    'insufficient credit',
+    'credit_balance',
+    'out of credits',
+    'not enough credit',
+    'payment_required',
+    'account_deactivated',
+    'deactivated',
+    'usage cap',
+    'daily usage limit',
+    'daily limit reached',
+    'access_terminated',
+    'no active billing',
+  ];
+
+  /// 表示「鉴权 Key 无效」的错误体关键词（401）。
+  static const List<String> authFailedKeywords = [
+    'invalid api key',
+    'invalid_api_key',
+    'authentication failed',
+    'unauthorized',
+    'incorrect api key',
+    'bad credentials',
+    'no api key provided',
+    'missing api key',
+  ];
+
+  /// 标记为「额度耗尽」后，对该 key 的冷却时长（毫秒）。
+  ///
+  /// 冷却期间后续请求自动跳过该 key（避免反复命中一个已耗尽的 key 拖慢
+  /// 其他可用 key），冷却结束后由 [KeyManager] 自动恢复为 active。
+  static const int quotaExhaustedCooldownMs = 30 * 60 * 1000; // 30 分钟
 
   // —— Phase 3：统计报表 ——
   static const int reportMaxDays = 90; // 报表最长回溯天数

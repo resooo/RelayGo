@@ -11,3 +11,7 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# 例外：Release 签名密钥库需随仓库保留，保证环境重置后签名指纹一致
+!keystore/*.jks
+!keystore/*.keystore

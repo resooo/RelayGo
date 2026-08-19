@@ -23,6 +23,24 @@ if (flutterVersionName == null) {
     flutterVersionName = '1.0'
 }
 
+// —— 固定 Release 签名配置 ——
+// 密钥库入库（android/keystore/relaygo-release.jks），随仓库保留，环境重置后
+// 签名指纹恒定，保证升级可覆盖安装。密码从 keystore.properties 读取
+// （该文件已在 .gitignore 中，不入库）；缺文件时回退 debug 签名以便本地开发。
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withReader('UTF-8') { reader ->
+        keystoreProperties.load(reader)
+    }
+}
+def String releaseStoreFile = keystoreProperties['RELEASE_STORE_FILE']
+def String releaseStorePassword = keystoreProperties['RELEASE_STORE_PASSWORD']
+def String releaseKeyAlias = keystoreProperties['RELEASE_KEY_ALIAS']
+def String releaseKeyPassword = keystoreProperties['RELEASE_KEY_PASSWORD']
+def hasReleaseSigning = releaseStoreFile != null && releaseStorePassword != null &&
+        releaseKeyAlias != null && releaseKeyPassword != null
+
 android {
     namespace "com.relaygo.app"
     compileSdkVersion 36
@@ -61,11 +79,30 @@ android {
         }
     }
 
+    signingConfigs {
+        // 固定 Release 签名：密钥随仓库保留，环境重置不改变指纹。
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        } else {
+            // keystore.properties 缺失（本地开发/GitHub 克隆）时回退 debug 签名
+            release {
+                storeFile file("${System.getProperty('user.home')}/.android/debug.keystore")
+                storePassword "android"
+                keyAlias "androiddebugkey"
+                keyPassword "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig signingConfigs.debug
+            // 用固定的 Release 签名（缺失则回退 debug），保证升级可覆盖安装。
+            signingConfig signingConfigs.release
         }
     }
 }

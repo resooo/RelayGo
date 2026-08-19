@@ -52,14 +52,17 @@ class KeyManager {
   List<ApiKey> getByProvider(String provider) =>
       getAll().where((k) => k.provider == provider).toList();
 
-  List<ApiKey> getActiveByProvider(String provider) =>
-      getByProvider(provider).where((k) => k.status == KeyStatus.active).toList();
+  List<ApiKey> getActiveByProvider(String provider) => getByProvider(provider)
+      .where((k) => k.status == KeyStatus.active)
+      .toList();
 
   /// 获取某提供商下当前「可用」的 key（用于构建候选池）。
   ///
-  /// 与 [getActiveByProvider] 的区别：处于 error 状态但冷却已过期的 key
-  /// 会自动恢复为 active 并持久化，从而打破
-  /// 「error 后永远无法回到候选池 → 永远无法成功 → 永远无法恢复」的死锁。
+  /// 与 [getActiveByProvider] 的区别：处于 `error` / `exhausted` 状态但冷却
+  /// 已过期的 key 会自动恢复为 active 并持久化，从而打破
+  /// 「标错/冷却后永远无法回到候选池 → 永远无法成功 → 永远无法恢复」的死锁。
+  /// 其中 `exhausted`（额度耗尽）在冷却到期后同样自动恢复，使被静默跳过的
+  /// key 在下一量周期内重新参与轮询。
   ///
   /// 注意：返回的 key 对象为内存副本，恢复状态已通过 [updateKey] 落库。
   List<ApiKey> getUsableByProvider(String provider) {
@@ -70,7 +73,7 @@ class KeyManager {
         usable.add(k);
         continue;
       }
-      if (k.status == KeyStatus.error &&
+      if ((k.status == KeyStatus.error || k.status == KeyStatus.exhausted) &&
           k.cooldownUntil != null &&
           k.cooldownUntil! <= now) {
         // 冷却已结束：自动恢复为 active，并持久化
@@ -179,7 +182,8 @@ class KeyManager {
   /// 返回 [BatchTestSummary] 汇总。
   Future<BatchTestSummary> batchTestKeys(
     List<ApiKey> keys, {
-    Future<void> Function(KeyTestRecord record, int done, int total)? onProgress,
+    Future<void> Function(KeyTestRecord record, int done, int total)?
+        onProgress,
     bool Function()? isCancelled,
     int concurrency = 5,
     Duration perKeyTimeout = const Duration(seconds: 10),
@@ -208,7 +212,8 @@ class KeyManager {
           outcome: outcome,
         ));
         done++;
-        if (onProgress != null) await onProgress(records.last, done, keys.length);
+        if (onProgress != null)
+          await onProgress(records.last, done, keys.length);
       }
     }
     return BatchTestSummary(records);
